@@ -1,6 +1,9 @@
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import datetime as dt
 from datetime import timezone
-import os
 import pandas as pd
 import backtrader as bt
 from backtrader import TimeFrame
@@ -9,9 +12,12 @@ from backtrader.filters import HeikinAshi
 import backtrader.analyzers as btanalyzers
 import warnings
 import quantstats
+import numpy as np
 
 from binance_store import BinanceStore
-from strategies.rsi_strategy import RSIStrategy
+from tools.strategies.BollingBear import BollingBear
+
+REPORT_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'report')
 
 class CommInfoFractional(CommInfoBase):
     """
@@ -193,67 +199,52 @@ def run_backtest(
     try:
         portfolio_stats = strat.analyzers.getbyname('pyfolio')
         
-        # Create a complete date range for the backtest period
-        date_range = pd.date_range(start=start_date, end=end_date, freq='1D')
+        # 创建完整的日期范围
+        date_range = pd.date_range(start=start_date, end=end_date, freq='D')
         
-        try:
-            if portfolio_stats is None:
-                print("Warning: PyFolio analyzer not found")
-                returns = pd.Series([0.0] * len(date_range), index=date_range)
-            else:
-                returns, positions, transactions, gross_lev = portfolio_stats.get_pf_items()
-                if returns is None or (hasattr(returns, 'empty') and returns.empty):
-                    print("Warning: No trades were made during the backtest period")
-                    # Use a tiny non-zero return to prevent division by zero
-                    returns = pd.Series([0.0001] + [0.0] * (len(date_range)-1), index=date_range)
-                else:
-                    # Convert timezone-aware index to timezone-naive
-                    returns.index = returns.index.tz_localize(None)
-                    # Convert minute returns to daily returns if needed
-                    if returns.index.freq != 'D':
-                        returns = returns.resample('D').agg('sum')
-                    # Reindex to ensure we have data for the full period
-                    returns = returns.reindex(date_range, fill_value=0.0)
-                    # If all returns are zero, add a tiny non-zero return
-                    if (returns == 0).all():
-                        returns.iloc[0] = 0.0001
-        except Exception as e:
-            print(f"Warning: Error getting PyFolio items: {str(e)}")
-            returns = pd.Series([0.0] * len(date_range), index=date_range)
-            
-        # Ensure we have at least two data points
-        if len(returns) < 2:
-            print("Warning: Adding extra day for minimum data requirements")
-            extra_date = date_range[-1] + pd.Timedelta(days=1)
-            returns[extra_date] = 0.0
+        # 获取收益数据并正确处理
+        returns, positions, transactions, gross_lev = portfolio_stats.get_pf_items()
         
-        # Ensure returns are properly formatted for quantstats
-        # Reuse the date_range we created earlier to ensure proper frequency
-        returns = pd.Series(
-            returns.reindex(date_range, method='ffill').values,
-            index=date_range,
-            dtype=float
+        # 确保返回值是日频的
+        if returns is not None and not returns.empty:
+            # 转换为日频数据
+            returns = returns.resample('D').sum()  # 使用 sum() 而不是 agg()
+        else:
+            # 如果没有交易，创建空的日频收益序列
+            returns = pd.Series(0, index=date_range)
+            returns.iloc[0] = 0.0001  # 添加小的非零值
+        
+        # 确保数据有效
+        returns = returns.fillna(0)
+        returns = returns.replace([np.inf, -np.inf], 0)
+        
+        # 生成报告
+        os.makedirs(REPORT_DIR, exist_ok=True)
+        report_path = os.path.join(REPORT_DIR, 'backtest_report.html')
+        
+        # 使用正确处理后的收益数据生成报告
+        quantstats.reports.html(
+            returns=returns,
+            output=report_path,
+            title='Trading Strategy Analysis'
         )
         
-        # Create report directory if it doesn't exist
-        os.makedirs('report', exist_ok=True)
+        # 打印统计信息
+        print("\n=== Returns Statistics ===")
+        print(f"Total Returns: {returns.sum():.2%}")
+        print(f"Average Daily Return: {returns.mean():.2%}")
+        print(f"Return Volatility: {returns.std():.2%}")
+        if returns.std() != 0:
+            print(f"Sharpe Ratio: {(returns.mean() / returns.std() * np.sqrt(252)):.2f}")
+        else:
+            print("Sharpe Ratio: N/A (zero volatility)")
         
-        # Save report to tools/report directory
-        report_path = 'report/backtest_report.html'
-        try:
-            quantstats.reports.html(returns, output=report_path, title='Trading Strategy Analysis',
-                                  download_filename=None)  # Prevent download attempts
-            print(f"\nQuantstats report generated: {report_path}")
-        except Exception as e:
-            print(f"Warning: Could not generate quantstats report: {str(e)}")
-            print(f"Returns shape: {returns.shape}")
-            print(f"Returns head: {returns.head()}")
-            print(f"Returns dtype: {returns.dtype}")
-        print(f"\nQuantstats report generated: {report_path}")
     except Exception as e:
         print(f"Warning: Could not generate quantstats report: {str(e)}")
         print(f"Returns shape: {returns.shape if 'returns' in locals() else 'N/A'}")
-        print(f"Returns head: {returns.head() if 'returns' in locals() else 'N/A'}")
+        if 'returns' in locals():
+            print(f"Returns head:\n{returns.head()}")
+            print(f"Returns statistics:\n{returns.describe()}")
     
     return results
     
@@ -266,10 +257,10 @@ def run_backtest(
 if __name__ == '__main__':
     # Example usage
     results = run_backtest(
-        strategy=RSIStrategy,
-        start_date='2024-01-01',
-        end_date='2024-02-01',
-        symbols=['BTCUSDT', 'ETHUSDT', 'SOLUSDT'],
+        strategy=BollingBear,
+        start_date='2023-01-01',
+        end_date='2024-06-01',
+        symbols=['BTCUSDT'],
         timeframe='15m',
         compression=1,
         initial_cash=200000,
@@ -277,11 +268,9 @@ if __name__ == '__main__':
         plot=True,
         use_local_data=True,
         data_path='\\\\znas\\Main\\spot',
-        # Strategy parameters
-        rsi_period=14,
-        rsi_lower=30,
-        rsi_upper=70,
-        stop_loss_pct=0.05,
-        btc_size=0.0005,
-        eth_size=0.05
+        # Strategy parameters - 只使用BollingBear支持的参数
+        period=20,          # 布林带周期
+        devfactor=2,        # 标准差倍数
+        size=1,             # 交易数量
+        stop_loss_pct=0.02  # 止损百分比
     )
